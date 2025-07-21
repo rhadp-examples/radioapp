@@ -1,0 +1,32 @@
+Name:           auto-apps
+Version:        @@VERSION@@
+Release:        1%{?dist}
+Summary:        Sample auto apps
+
+License:        MIT
+Source0:        auto-apps-%{version}.tar.gz
+
+
+BuildRequires:  cmake make gcc-c++ boost-devel vsomeip3-devel
+
+%description
+Sample auto applications
+
+%prep
+%autosetup
+
+%build
+%cmake
+%cmake_build
+
+%install
+%cmake_install
+
+%files
+%{_bindir}/engine-service
+%{_bindir}/radio-client
+%{_bindir}/radio-service
+
+%changelog
+* Mon Mar 14 2022 Alexander Larsson <alexl@redhat.com>
+- Initial version

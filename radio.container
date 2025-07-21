@@ -1,0 +1,16 @@
+[Unit]
+Description=Demo radio service container
+Requires=routingmanagerd.socket
+After=routingmanagerd.socket
+
+[Container]
+Image=localhost/app
+Entrypoint=/usr/local/bin/radio-service
+Volume=/run/vsomeip:/run/vsomeip
+Volume=/run/dlt:/run/dlt
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

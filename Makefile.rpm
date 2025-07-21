@@ -1,0 +1,15 @@
+VERSION=0.1
+
+TOPDIR=$(shell pwd)
+
+auto-apps-$(VERSION).tar.gz:
+	git archive HEAD . --prefix=auto-apps-$(VERSION)/ --output=auto-apps-$(VERSION).tar.gz
+
+
+srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
+	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
+	rpmbuild -bs --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
+
+rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
+	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
+	rpmbuild -ba --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec

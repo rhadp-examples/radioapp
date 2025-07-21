@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+podman exec -ti systemd-radio radio-client
