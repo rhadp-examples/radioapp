@@ -74,11 +74,3 @@ fi
 %attr(0644,root,root) %{_datadir}/selinux/packages/automotive/auto-apps.pp
 
 %changelog
-* Mon Nov 09 2026 Sebastian Hetze <shetze@redhat.com> - @@VERSION@@-3 (auto-apps-selinux)
-- Build SELinux policy directly from .te source file
-
-* Mon Nov 09 2026 Sebastian Hetze <shetze@redhat.com> - @@VERSION@@-2 (auto-apps-selinux)
-- Initial build of the custom SELinux policy.
-
-* Mon Mar 14 2022 Alexander Larsson <alexl@redhat.com> - @@VERSION@@-1 (auto-apps)
-- Initial version

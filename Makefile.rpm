@@ -1,4 +1,4 @@
-VERSION=0.1
+VERSION=0.2
 
 TOPDIR=$(shell pwd)
 
@@ -8,6 +8,13 @@ auto-apps-$(VERSION).tar.gz:
 
 srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
 	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
+	RELEASE=$(git rev-list --count HEAD)
+	sed -i "s/^Release:.*/Release:        ${RELEASE}%{?dist}/" auto-apps.spec
+	git log -n 10 --no-merges --format="%cd|%aN <%aE>|%s" --date=format:"%a %b %d %Y" | \
+            awk -F'|' -v ver="$VERSION" -v rel="$RELEASE" '{
+                printf "* %s %s - %s-%d\n- %s\n\n", $1, $2, ver, rel, $3;
+                rel--;
+            }' >> auto-apps.spec
 	rpmbuild -bs --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
 
 rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
