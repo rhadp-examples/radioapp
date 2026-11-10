@@ -73,4 +73,3 @@ fi
 %files selinux
 %attr(0644,root,root) %{_datadir}/selinux/packages/automotive/auto-apps.pp
 
-%changelog
