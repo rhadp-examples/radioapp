@@ -1,4 +1,4 @@
-VERSION=0.2
+VERSION=0.1
 TOPDIR=$(shell pwd)
 
 # --- global release number calculation for the current build ---
@@ -47,4 +47,4 @@ rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec
 
 clean:
 	rm -f auto-apps.spec auto-apps-*.tar.gz
-	rm -rf $(TOPDIR)/*.rpm $(TOPDIR)/*.srpm
+	rm -rf $(TOPDIR)/auto-apps*.rpm $(TOPDIR)/auto-apps*.srpm
