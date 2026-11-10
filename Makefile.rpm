@@ -1,4 +1,4 @@
-VERSION=0.1
+VERSION=0.2
 TOPDIR=$(shell pwd)
 
 # --- global release number calculation for the current build ---
@@ -27,7 +27,7 @@ auto-apps.spec: auto-apps.spec.in
 	while IFS='|' read -r hash date author msg; do \
 		c_tag=$$(git describe --tags --abbrev=0 $$hash 2>/dev/null); \
 		if [ -z "$$c_tag" ]; then \
-			c_ver="$(VERSION)"; \
+			c_ver="0.1"; \
 			c_rel=$$(git rev-list --count $$hash); \
 		else \
 			c_ver=$$(echo "$$c_tag" | sed 's/^[vV]//'); \
