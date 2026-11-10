@@ -1,22 +1,33 @@
 VERSION=0.2
-
+RELEASE=$(shell git rev-list --count HEAD)
 TOPDIR=$(shell pwd)
 
+.PHONY: srpm rpm clean
+
 auto-apps-$(VERSION).tar.gz:
-	git archive HEAD . --prefix=auto-apps-$(VERSION)/ --output=auto-apps-$(VERSION).tar.gz
+        git archive HEAD . --prefix=auto-apps-$(VERSION)/ --output=$@
 
+auto-apps.spec: auto-apps.spec.in
+        sed 's/@@VERSION@@/$(VERSION)/g' $< > $@
+        sed -i 's/^Release:.*/Release:        $(RELEASE)%{?dist}/' $@
+        echo "" >> $@
+        echo "%changelog" >> $@
+        LC_ALL=C git log -n 10 --no-merges --format="%H|%cd|%aN <%aE>|%s" --date=format:"%a %b %d %Y" | \
+        while IFS='|' read -r hash date author msg; do \
+                c_ver=$$(git describe --tags --abbrev=0 $$hash 2>/dev/null | sed 's/^[vV]//' || echo "$(VERSION)"); \
+                c_rel=$$(git rev-list --count $$hash); \
+                echo "* $$date $$author - $$c_ver-$$c_rel"; \
+                echo "- $$msg"; \
+                echo ""; \
+        done >> $@
 
-srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
-	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
-	RELEASE=$(git rev-list --count HEAD)
-	sed -i "s/^Release:.*/Release:        ${RELEASE}%{?dist}/" auto-apps.spec
-	git log -n 10 --no-merges --format="%cd|%aN <%aE>|%s" --date=format:"%a %b %d %Y" | \
-            awk -F'|' -v ver="$VERSION" -v rel="$RELEASE" '{
-                printf "* %s %s - %s-%d\n- %s\n\n", $1, $2, ver, rel, $3;
-                rel--;
-            }' >> auto-apps.spec
-	rpmbuild -bs --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
+srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec
+        rpmbuild -bs --define "_srcrpmdir $(TOPDIR)" --define "_sourcedir $(TOPDIR)" auto-apps.spec
 
-rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
-	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
-	rpmbuild -ba --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
+rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec
+        rpmbuild -ba --define "_rpmdir $(TOPDIR)" --define "_srcrpmdir $(TOPDIR)" --define "_sourcedir $(TOPDIR)" auto-apps.spec
+
+clean:
+        rm -f auto-apps.spec auto-apps-*.tar.gz
+        rm -rf $(TOPDIR)/auto-apps*.rpm $(TOPDIR)/auto-apps*.srpm
+
