@@ -1,4 +1,8 @@
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
 #include <csignal>
+#include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -14,15 +18,64 @@ using namespace std::literals::chrono_literals;
 #include "services.hpp"
 #include "radio-stations.hpp"
 
+namespace {
+
+// Use consumed thread CPU time so that scheduling delays caused by competing
+// workloads extend the wall-clock duration of this demo computation.
+std::uint64_t thread_cpu_time_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ULL
+         + static_cast<std::uint64_t>(ts.tv_nsec);
+}
+
+// Busy work is intentionally independent of the application's normal logic.
+void demo_cpu_work(unsigned cpu_ms) {
+    const std::uint64_t start_ns = thread_cpu_time_ns();
+    const std::uint64_t duration_ns = static_cast<std::uint64_t>(cpu_ms) * 1000000ULL;
+    std::uint64_t state = 0x9e3779b97f4a7c15ULL;
+
+    while (thread_cpu_time_ns() - start_ns < duration_ns) {
+        for (unsigned i = 0; i < 16384; ++i) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+        }
+    }
+
+    // Make the result observable so optimizing builds retain the computation.
+    static volatile std::uint64_t sink;
+    sink ^= state;
+}
+
+unsigned demo_cpu_duration_ms() {
+    const char *value = std::getenv("RADIO_DEMO_CPU_MS");
+    if (value == nullptr || *value == '\0')
+        return 0;
+
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (value[0] == '-' || value[0] == '+' || end == value || *end != '\0'
+            || errno != 0 || parsed > 5000UL) {
+        std::cerr << "RADIO: Invalid RADIO_DEMO_CPU_MS (expected 0..5000): "
+                  << value << std::endl;
+        return 0;
+    }
+    return static_cast<unsigned>(parsed);
+}
+
+} // namespace
+
 class radio_service {
 public:
     radio_service() :
             app(vsomeip::runtime::get()->create_application("Radio")),
-            verbose(false),
             main_blocked(false),
             main_running(true),
             is_offered(false),
             engine_available(false),
+            verbose(false),
             next_volume(50),
             next_radio_station(0),
             next_playing(false),
@@ -163,8 +216,24 @@ public:
         uint32_t current_song = 0;
         bool goto_next_song = true;
         std::chrono::time_point<std::chrono::system_clock> next_song_at;
+        const unsigned demo_cpu_ms = demo_cpu_duration_ms();
+        const char *lock_env = std::getenv("RADIO_DEMO_HOLD_MUTEX");
+        const bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
+                                   && lock_env[1] == '\0';
+
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
+
+        // Wait until init() has completed before offering the service.
+        while (!main_blocked)
+            main_condition.wait(its_lock);
+
+        if (demo_cpu_ms > 0) {
+            std::cout << "RADIO: CPU demo enabled (" << demo_cpu_ms
+                      << " ms thread CPU time per cycle, mutex "
+                      << (demo_hold_mutex ? "held" : "released") << ")"
+                      << std::endl;
+        }
 
         offer();
 
@@ -238,8 +307,29 @@ public:
                 currently_playing = false;
             }
 
-            if (main_condition.wait_until(its_lock, next_song_at) ==  std::cv_status::timeout) {
-                goto_next_song = true;
+            if (demo_cpu_ms > 0) {
+                // Releasing the mutex isolates CPU scheduling interference.
+                // Holding it additionally delays SOME/IP callbacks that need
+                // access to the radio state, intentionally amplifying failures.
+                if (!demo_hold_mutex)
+                    its_lock.unlock();
+
+                demo_cpu_work(demo_cpu_ms);
+
+                if (!demo_hold_mutex)
+                    its_lock.lock();
+
+                // Keep the CPU load almost continuous, but briefly release
+                // the mutex to allow state updates and normal shutdown.
+                main_condition.wait_for(its_lock, 2ms);
+
+                // Preserve song changes despite replacing the original wait.
+                if (next_playing && std::chrono::system_clock::now() >= next_song_at)
+                    goto_next_song = true;
+            } else {
+                // Preserve the original timing when demo mode is disabled.
+                if (main_condition.wait_until(its_lock, next_song_at) == std::cv_status::timeout)
+                    goto_next_song = true;
             }
         }
     }
@@ -396,11 +486,10 @@ private:
 
     std::shared_ptr< vsomeip::application > app;
 
-    std::thread main_thread;
     std::mutex main_mutex;
     std::condition_variable main_condition;
     bool main_blocked;
-    bool main_running;
+    std::atomic<bool> main_running;
     bool is_offered;
     bool engine_available;
 
@@ -410,6 +499,9 @@ private:
     uint32_t next_radio_station;
     bool next_playing;
     bool next_reversed;
+
+    // Start the worker only after all state and synchronization are initialized.
+    std::thread main_thread;
 };
 
 radio_service *its_radio_ptr(nullptr);
