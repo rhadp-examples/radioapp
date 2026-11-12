@@ -1,4 +1,4 @@
-VERSION=0.2
+VERSION=0.3
 TOPDIR=$(shell pwd)
 
 # --- global release number calculation for the current build ---
