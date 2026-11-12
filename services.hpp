@@ -11,6 +11,9 @@
 #define RADIO_SWITCH_STATION_METHOD_ID 5
 
 #define RADIO_EVENTGROUP_ID 0x4001
+
+// Demo-only station event value indicating RAM allocation failure.
+#define RADIO_RAM_FAILURE_MARKER "__RADIO_DEMO_RAM_FAILURE__"
 #define RADIO_VOLUME_EVENT_ID 0x8000 + 1
 #define RADIO_STATION_EVENT_ID 0x8000 + 2
 #define RADIO_SONG_EVENT_ID 0x8000 + 3

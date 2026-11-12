@@ -60,6 +60,7 @@ void on_artist_message(const std::shared_ptr<vsomeip::message> &_event) {
 }
 
 void on_station_message(const std::shared_ptr<vsomeip::message> &_event) {
+    std::unique_lock<std::mutex> its_lock(mutex);
     radio_station = get_arg0_string(_event);
     data_changed = true;
     condition.notify_one();
@@ -160,10 +161,22 @@ void run() {
                 << "\e[1;1H"   // Goto row 1;
               ;
             if (service_available) {
+                if (radio_station == RADIO_RAM_FAILURE_MARKER) {
+                    // Replace metadata rows with a compact ASCII RAM warning.
+                    // Keep volume and reverse status visible below the banner.
+                    std::cout
+                        << "\e[1;31m"
+                        << "  +--------------------------------------+" << std::endl
+                        << "  |  !!            R A M            !!  |" << std::endl
+                        << "  +--------------------------------------+"
+                        << "\e[0m" << std::endl;
+                } else {
+                    std::cout
+                        << "Station: " << radio_station << std::endl
+                        << "Song:    " << song << std::endl
+                        << "Artist:  " << artist << std::endl;
+                }
                 std::cout
-                    << "Station: " << radio_station << std::endl
-                    << "Song:    " << song << std::endl
-                    << "Artist:  " << artist << std::endl
                     << "Volume:  [" << volume_meter(volume) << "] " << std::endl
                     << (in_reverse ?
                         "------------------------------[REVERSING]-" :

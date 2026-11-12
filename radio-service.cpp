@@ -2,17 +2,25 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cctype>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <new>
 #include <csignal>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdlib>
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
 
 using namespace std::literals::chrono_literals;
 
@@ -67,6 +75,191 @@ unsigned demo_cpu_duration_ms() {
     }
     return static_cast<unsigned>(parsed);
 }
+
+// Configure the size of the resident memory working set used by the RAM demo.
+// Supported units are K, M, and G (binary multiples), e.g. 512M or 8G.
+// An unset or zero value disables the RAM demo.
+std::uint64_t demo_ram_size_bytes() {
+    const char *value = std::getenv("RADIO_DEMO_RAM_SIZE");
+    if (value == nullptr || *value == '\0')
+        return 0;
+
+    char *end = nullptr;
+    errno = 0;
+    const unsigned long long count = std::strtoull(value, &end, 10);
+    bool valid = value[0] != '-' && value[0] != '+' && end != value && errno == 0;
+    std::uint64_t multiplier = 1;
+    if (valid && *end != '\0') {
+        const char unit = static_cast<char>(std::toupper(static_cast<unsigned char>(*end++)));
+        if (unit == 'K')
+            multiplier = 1024ULL;
+        else if (unit == 'M')
+            multiplier = 1024ULL * 1024ULL;
+        else if (unit == 'G')
+            multiplier = 1024ULL * 1024ULL * 1024ULL;
+        else
+            valid = false;
+        if (*end == 'B' || *end == 'b')
+            ++end;
+        if (*end != '\0')
+            valid = false;
+    }
+    if (!valid || count > std::numeric_limits<std::uint64_t>::max() / multiplier
+            || count * multiplier > std::numeric_limits<std::size_t>::max()) {
+        std::cerr << "RADIO: Invalid RADIO_DEMO_RAM_SIZE (use e.g. 512M or 8G): "
+                  << value << std::endl;
+        return 0;
+    }
+    return static_cast<std::uint64_t>(count) * multiplier;
+}
+
+constexpr std::uint64_t demo_ram_headroom_bytes = 256ULL * 1024ULL * 1024ULL;
+constexpr std::size_t demo_ram_chunk_bytes = 16ULL * 1024ULL * 1024ULL;
+
+// Linux can overcommit virtual memory: a successful new[] does not prove that
+// physical pages are available. Check both host MemAvailable and cgroup v2
+// headroom before each chunk is allocated and its pages are written.
+// These checks are best-effort, not an atomic guarantee against the OOM killer.
+bool demo_read_number(const char *path, std::uint64_t &result) {
+    std::ifstream input(path);
+    std::string value;
+    if (!(input >> value) || value == "max" || value.empty())
+        return false;
+    for (const char c : value) {
+        if (c < '0' || c > '9')
+            return false;
+    }
+    try {
+        result = std::stoull(value);
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
+}
+
+bool demo_host_available(std::uint64_t &bytes) {
+    std::ifstream input("/proc/meminfo");
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.compare(0, 13, "MemAvailable:") != 0)
+            continue;
+        std::istringstream text(line.substr(13));
+        std::uint64_t available_kib = 0;
+        if (!(text >> available_kib)
+                || available_kib > std::numeric_limits<std::uint64_t>::max() / 1024ULL)
+            return false;
+        bytes = available_kib * 1024ULL;
+        return true;
+    }
+    return false;
+}
+
+// Never intentionally consume the final 256 MiB of reported available memory.
+// Cgroup limits are checked when a finite memory.max is visible. When no
+// limit is exposed, the host estimate is the available fallback.
+bool demo_ram_has_capacity(std::uint64_t next_chunk_bytes, std::string &reason) {
+    if (next_chunk_bytes > std::numeric_limits<std::uint64_t>::max()
+                           - demo_ram_headroom_bytes) {
+        reason = "requested chunk exceeds supported size";
+        return false;
+    }
+    const std::uint64_t needed = next_chunk_bytes + demo_ram_headroom_bytes;
+    std::uint64_t host_bytes = 0;
+    const bool host_known = demo_host_available(host_bytes);
+    if (host_known && host_bytes < needed) {
+        reason = "host MemAvailable below required headroom";
+        return false;
+    }
+    std::uint64_t limit = 0;
+    std::uint64_t current = 0;
+    bool cgroup_known = demo_read_number("/sys/fs/cgroup/memory.max", limit)
+            && demo_read_number("/sys/fs/cgroup/memory.current", current);
+    if (!cgroup_known) {
+        // Older distributions may still use cgroup v1 memory accounting.
+        cgroup_known = demo_read_number(
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes", limit)
+                && demo_read_number(
+                "/sys/fs/cgroup/memory/memory.usage_in_bytes", current);
+        // Some v1 implementations encode "no limit" with a huge number.
+        if (limit >= (1ULL << 60))
+            cgroup_known = false;
+    }
+    if (cgroup_known && (current >= limit || limit - current < needed)) {
+        reason = "cgroup memory.max headroom exhausted";
+        return false;
+    }
+    // Without either capacity estimate the OOM risk cannot be bounded.
+    if (!host_known && !cgroup_known) {
+        reason = "memory availability could not be determined";
+        return false;
+    }
+    return true;
+}
+
+// Keep one committed working set for the lifetime of a song. Release the
+// previous song's pages before acquiring the next working set. Every system
+// page is touched, otherwise Linux overcommit could leave an 8G buffer with
+// almost no physical memory footprint.
+class demo_ram_buffer {
+public:
+    void release() {
+        chunks_.clear();
+        allocated_bytes_ = 0;
+    }
+
+    bool acquire(std::uint64_t requested, std::string &reason,
+                 std::uint64_t &bytes_before_rollback) {
+        release();
+        bytes_before_rollback = 0;
+        if (requested == 0)
+            return true;
+        // Fail before consuming host memory when the full request is already
+        // larger than the reported capacity. Repeat the check per chunk to
+        // account for other workloads consuming RAM during allocation.
+        if (!demo_ram_has_capacity(requested, reason))
+            return false;
+
+        const long configured_page_size = sysconf(_SC_PAGESIZE);
+        const std::size_t page_size = configured_page_size > 0
+                ? static_cast<std::size_t>(configured_page_size) : 4096;
+        try {
+            while (allocated_bytes_ < requested) {
+                const std::size_t chunk_size = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(requested - allocated_bytes_,
+                                                 demo_ram_chunk_bytes));
+                if (!demo_ram_has_capacity(chunk_size, reason))
+                    break;
+
+                std::unique_ptr<std::uint8_t[]> chunk(
+                        new (std::nothrow) std::uint8_t[chunk_size]);
+                if (!chunk) {
+                    reason = "allocation returned nullptr";
+                    break;
+                }
+                volatile std::uint8_t *const pages = chunk.get();
+                for (std::size_t offset = 0; offset < chunk_size; offset += page_size)
+                    pages[offset] = 0xA5;
+                pages[chunk_size - 1] = 0xA5;
+
+                chunks_.push_back(std::move(chunk));
+                allocated_bytes_ += chunk_size;
+            }
+        } catch (const std::bad_alloc &) {
+            reason = "allocation failed (std::bad_alloc)";
+        }
+
+        if (allocated_bytes_ == requested)
+            return true;
+
+        bytes_before_rollback = allocated_bytes_;
+        release();
+        return false;
+    }
+
+private:
+    std::vector<std::unique_ptr<std::uint8_t[]>> chunks_;
+    std::uint64_t allocated_bytes_ = 0;
+};
 
 // This is a synthetic display fault, not a detection of real network corruption.
 // Allow 10% plus 10 ms of scheduling overhead before reporting a missed budget.
@@ -373,6 +566,9 @@ public:
         unsigned garbage_level = 0;
         bool garbage_level_changed = false;
         demo_cpu_metrics demo_metrics;
+        const std::uint64_t demo_ram_bytes = demo_ram_size_bytes();
+        demo_ram_buffer ram_working_set;
+        bool ram_failure = false;
 
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
@@ -391,10 +587,20 @@ public:
                       << "to enable workload delay metrics" << std::endl;
         }
 
+        if (demo_ram_bytes > 0) {
+            std::cout << "RADIO: RAM demo enabled ("
+                      << demo_ram_bytes / (1024ULL * 1024ULL)
+                      << " MiB per song, 256 MiB safety headroom)" << std::endl;
+        } else {
+            std::cout << "RADIO: RAM demo disabled; set RADIO_DEMO_RAM_SIZE=8G "
+                      << "to enable per-song allocation" << std::endl;
+        }
+
         offer();
 
         while (main_running) {
             bool display = false;
+            bool station_changed = false;
 
             if (next_reversed != current_reversed) {
                 if (next_reversed) {
@@ -425,7 +631,7 @@ public:
                 goto_next_song = true;
                 station_info = get_radio_stations(current_station);
                 display = true;
-                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_STATION_EVENT_ID, payload_with_string (station_info->name));
+                station_changed = true;
             }
 
             if (next_playing) {
@@ -441,11 +647,75 @@ public:
                         current_song = rand() % station_info->n_songs;
                     } while (old == current_song);
                     goto_next_song = false;
-                    next_song_at = std::chrono::system_clock::now() + 3s + (rand() % 3000) * 1ms;
                     display = true;
+
+                    const bool previous_ram_failure = ram_failure;
+                    if (demo_ram_bytes > 0) {
+                        std::string failure_reason;
+                        std::uint64_t partially_allocated_bytes = 0;
+                        const auto allocation_started = std::chrono::steady_clock::now();
+
+                        // Memory allocation can take seconds for large buffers.
+                        // Do not hold the radio state mutex while touching pages.
+                        its_lock.unlock();
+                        const bool acquired = ram_working_set.acquire(
+                                demo_ram_bytes, failure_reason, partially_allocated_bytes);
+                        const auto allocation_elapsed = std::chrono::steady_clock::now()
+                                - allocation_started;
+                        its_lock.lock();
+
+                        std::ostringstream ram_log;
+                        ram_log << std::fixed << std::setprecision(1)
+                                << "RADIO: RAM demo: requested="
+                                << demo_ram_bytes / (1024.0 * 1024.0)
+                                << "MiB result=" << (acquired ? "OK" : "FAILED")
+                                << " duration="
+                                << std::chrono::duration<double, std::milli>(
+                                           allocation_elapsed).count()
+                                << "ms";
+                        if (!acquired)
+                            ram_log << " allocated_before_rollback="
+                                    << partially_allocated_bytes / (1024.0 * 1024.0)
+                                    << "MiB reason=" << failure_reason;
+                        std::cout << ram_log.str() << std::endl;
+
+                        // An intervening station or playback request makes the
+                        // just-prepared song obsolete. Re-evaluate on next pass.
+                        // Preserve the previous RAM display state until the
+                        // pending request has been processed by the main loop.
+                        if (!next_playing || next_radio_station != current_station) {
+                            ram_working_set.release();
+                            goto_next_song = true;
+                            continue;
+                        }
+                        ram_failure = !acquired;
+                    } else {
+                        ram_failure = false;
+                    }
+
+                    next_song_at = std::chrono::system_clock::now()
+                            + 3s + (rand() % 3000) * 1ms;
+                    if (ram_failure) {
+                        // A marker in the existing station event lets the
+                        // client replace the three metadata rows with RAM art.
+                        if (!previous_ram_failure || station_changed) {
+                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                                    RADIO_STATION_EVENT_ID,
+                                    payload_with_string(RADIO_RAM_FAILURE_MARKER));
+                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                                    RADIO_SONG_EVENT_ID, payload_with_string("RAM"));
+                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                                    RADIO_ARTIST_EVENT_ID, payload_with_string(""));
+                        }
+                    } else if (previous_ram_failure || station_changed) {
+                        // Restore the true station on recovery or a switch.
+                        app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                                RADIO_STATION_EVENT_ID,
+                                payload_with_string(station_info->name));
+                    }
                 }
 
-                if (display || garbage_level_changed) {
+                if ((display || garbage_level_changed) && !ram_failure) {
                     struct song_info_t *song = &station_info->songs[current_song];
                     const std::string title = demo_corrupt_text(song->name, garbage_level, current_song);
                     const std::string artist = demo_corrupt_text(song->artist, garbage_level,
@@ -472,9 +742,18 @@ public:
                     }
                     garbage_level_changed = false;
                 }
+                if (ram_failure)
+                    garbage_level_changed = false;
             } else {
                 if (currently_playing)
                     std::cout << "RADIO: Paused playing" << std::endl;
+                if (currently_playing || ram_failure)
+                    ram_working_set.release();
+                if (ram_failure || station_changed) {
+                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                            RADIO_STATION_EVENT_ID, payload_with_string(station_info->name));
+                    ram_failure = false;
+                }
                 app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_SONG_EVENT_ID, payload_with_string ("-off-"));
                 app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_ARTIST_EVENT_ID, payload_with_string (""));
                 currently_playing = false;
@@ -519,8 +798,15 @@ public:
                     goto_next_song = true;
             } else {
                 // Preserve the original timing when demo mode is disabled.
-                if (main_condition.wait_until(its_lock, next_song_at) == std::cv_status::timeout)
+                // Avoid a busy loop against an expired deadline when paused.
+                if (!next_playing) {
+                    main_condition.wait(its_lock, [this] {
+                        return !main_running || next_playing;
+                    });
+                } else if (main_condition.wait_until(its_lock, next_song_at)
+                        == std::cv_status::timeout) {
                     goto_next_song = true;
+                }
             }
         }
     }
