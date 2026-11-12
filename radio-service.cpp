@@ -261,6 +261,37 @@ private:
     std::uint64_t allocated_bytes_ = 0;
 };
 
+// Keep the RAM warning visible for at least 15 seconds after the most recent
+// allocation failure. A successful allocation only clears the outstanding
+// failure; it cannot shorten the display hold. A new failure restarts the hold.
+class demo_ram_warning_state {
+public:
+    using clock = std::chrono::steady_clock;
+
+    void record_failure(clock::time_point now) {
+        allocation_failed_ = true;
+        visible_until_ = now + std::chrono::seconds(15);
+        last_failure_at_ = now;
+    }
+
+    void clear_allocation_failure() {
+        allocation_failed_ = false;
+    }
+
+    bool active(clock::time_point now) const {
+        return allocation_failed_ || now < visible_until_;
+    }
+
+    clock::time_point last_failure_at() const {
+        return last_failure_at_;
+    }
+
+private:
+    bool allocation_failed_ = false;
+    clock::time_point visible_until_{};
+    clock::time_point last_failure_at_{};
+};
+
 // This is a synthetic display fault, not a detection of real network corruption.
 // Allow 10% plus 10 ms of scheduling overhead before reporting a missed budget.
 // The number of inserted symbols rises gradually with the wall-clock overrun.
@@ -568,7 +599,8 @@ public:
         demo_cpu_metrics demo_metrics;
         const std::uint64_t demo_ram_bytes = demo_ram_size_bytes();
         demo_ram_buffer ram_working_set;
-        bool ram_failure = false;
+        demo_ram_warning_state ram_warning;
+        bool ram_warning_displayed = false;
 
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
@@ -649,7 +681,6 @@ public:
                     goto_next_song = false;
                     display = true;
 
-                    const bool previous_ram_failure = ram_failure;
                     if (demo_ram_bytes > 0) {
                         std::string failure_reason;
                         std::uint64_t partially_allocated_bytes = 0;
@@ -679,43 +710,73 @@ public:
                                     << "MiB reason=" << failure_reason;
                         std::cout << ram_log.str() << std::endl;
 
+                        if (!acquired) {
+                            // Every failure restarts the minimum display hold,
+                            // even if the competing process has already exited.
+                            ram_warning.record_failure(std::chrono::steady_clock::now());
+                            std::cout << "RADIO: RAM demo: warning held for at least 15s "
+                                         "after the latest allocation failure"
+                                      << std::endl;
+                        }
+
                         // An intervening station or playback request makes the
-                        // just-prepared song obsolete. Re-evaluate on next pass.
-                        // Preserve the previous RAM display state until the
-                        // pending request has been processed by the main loop.
+                        // just-prepared song obsolete. Preserve any RAM warning
+                        // that was already triggered while retrying the request.
                         if (!next_playing || next_radio_station != current_station) {
                             ram_working_set.release();
                             goto_next_song = true;
                             continue;
                         }
-                        ram_failure = !acquired;
-                    } else {
-                        ram_failure = false;
+                        if (acquired)
+                            ram_warning.clear_allocation_failure();
                     }
 
                     next_song_at = std::chrono::system_clock::now()
                             + 3s + (rand() % 3000) * 1ms;
-                    if (ram_failure) {
-                        // A marker in the existing station event lets the
-                        // client replace the three metadata rows with RAM art.
-                        if (!previous_ram_failure || station_changed) {
-                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
-                                    RADIO_STATION_EVENT_ID,
-                                    payload_with_string(RADIO_RAM_FAILURE_MARKER));
-                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
-                                    RADIO_SONG_EVENT_ID, payload_with_string("RAM"));
-                            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
-                                    RADIO_ARTIST_EVENT_ID, payload_with_string(""));
-                        }
-                    } else if (previous_ram_failure || station_changed) {
-                        // Restore the true station on recovery or a switch.
-                        app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
-                                RADIO_STATION_EVENT_ID,
-                                payload_with_string(station_info->name));
-                    }
                 }
+            } else {
+                if (currently_playing)
+                    std::cout << "RADIO: Paused playing" << std::endl;
+                if (currently_playing)
+                    ram_working_set.release();
+                // Pausing stops allocation attempts, but does not cancel the
+                // minimum warning duration after a prior allocation failure.
+                ram_warning.clear_allocation_failure();
+                currently_playing = false;
+            }
 
-                if ((display || garbage_level_changed) && !ram_failure) {
+            // The warning is a display state, not the result of the most recent
+            // allocation alone. Do not republish station, title, or artist data
+            // while it is active, including on song/station changes or when
+            // CPU-induced garbage levels change.
+            const bool show_ram_warning = ram_warning.active(std::chrono::steady_clock::now());
+            if (show_ram_warning && !ram_warning_displayed) {
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_STATION_EVENT_ID,
+                        payload_with_string(RADIO_RAM_FAILURE_MARKER));
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_SONG_EVENT_ID, payload_with_string("RAM"));
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_ARTIST_EVENT_ID, payload_with_string(""));
+                ram_warning_displayed = true;
+                std::cout << "RADIO: RAM demo: warning displayed" << std::endl;
+            } else if (!show_ram_warning && ram_warning_displayed) {
+                ram_warning_displayed = false;
+                display = true;
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_STATION_EVENT_ID, payload_with_string(station_info->name));
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - ram_warning.last_failure_at());
+                std::cout << "RADIO: RAM demo: warning cleared after "
+                          << elapsed.count()
+                          << "ms; resuming normal metadata" << std::endl;
+            } else if (station_changed && !ram_warning_displayed) {
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_STATION_EVENT_ID, payload_with_string(station_info->name));
+            }
+
+            if (next_playing) {
+                if ((display || garbage_level_changed) && !ram_warning_displayed) {
                     struct song_info_t *song = &station_info->songs[current_song];
                     const std::string title = demo_corrupt_text(song->name, garbage_level, current_song);
                     const std::string artist = demo_corrupt_text(song->artist, garbage_level,
@@ -742,22 +803,14 @@ public:
                     }
                     garbage_level_changed = false;
                 }
-                if (ram_failure)
-                    garbage_level_changed = false;
-            } else {
-                if (currently_playing)
-                    std::cout << "RADIO: Paused playing" << std::endl;
-                if (currently_playing || ram_failure)
-                    ram_working_set.release();
-                if (ram_failure || station_changed) {
-                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
-                            RADIO_STATION_EVENT_ID, payload_with_string(station_info->name));
-                    ram_failure = false;
-                }
-                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_SONG_EVENT_ID, payload_with_string ("-off-"));
-                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_ARTIST_EVENT_ID, payload_with_string (""));
-                currently_playing = false;
+            } else if (!ram_warning_displayed) {
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_SONG_EVENT_ID, payload_with_string("-off-"));
+                app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_ARTIST_EVENT_ID, payload_with_string(""));
             }
+            if (ram_warning_displayed)
+                garbage_level_changed = false;
 
             if (demo_cpu_ms > 0) {
                 // Releasing the mutex isolates CPU scheduling interference.
@@ -797,9 +850,15 @@ public:
                 if (next_playing && std::chrono::system_clock::now() >= next_song_at)
                     goto_next_song = true;
             } else {
-                // Preserve the original timing when demo mode is disabled.
-                // Avoid a busy loop against an expired deadline when paused.
-                if (!next_playing) {
+                // While the RAM warning is visible, wake periodically so its
+                // 15-second hold can end without waiting for another song.
+                // This also works when playback is paused and CPU load is off.
+                if (ram_warning_displayed) {
+                    main_condition.wait_for(its_lock, 250ms);
+                    if (next_playing && std::chrono::system_clock::now() >= next_song_at)
+                        goto_next_song = true;
+                } else if (!next_playing) {
+                    // Preserve the original idle behavior outside demo errors.
                     main_condition.wait(its_lock, [this] {
                         return !main_running || next_playing;
                     });
