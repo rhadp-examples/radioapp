@@ -86,6 +86,83 @@ unsigned demo_garbage_level(unsigned cpu_ms, std::chrono::steady_clock::duration
     return std::min(12u, 1u + static_cast<unsigned>(scaled));
 }
 
+// Track wall-clock delays independently of the process-wide %CPU reported by
+// monitoring tools. Off-CPU time can include preemption, throttling and other
+// stalls; it should not be interpreted as an exact scheduler latency metric.
+class demo_cpu_metrics {
+public:
+    void record(unsigned target_cpu_ms,
+                std::chrono::steady_clock::duration work_elapsed,
+                std::uint64_t consumed_cpu_ns,
+                std::chrono::steady_clock::duration mutex_wait,
+                unsigned garbage_level) {
+        const double wall_ms = to_ms(work_elapsed);
+        const double actual_cpu_ms = static_cast<double>(consumed_cpu_ns) / 1000000.0;
+        const double off_cpu_ms = std::max(0.0, wall_ms - actual_cpu_ms);
+        const double cpu_share_percent = wall_ms > 0.0
+                ? 100.0 * actual_cpu_ms / wall_ms : 0.0;
+        const double deadline_ms = static_cast<double>(target_cpu_ms) * 1.10 + 10.0;
+        const double overrun_ms = std::max(0.0, wall_ms - deadline_ms);
+        const double mutex_wait_ms = to_ms(mutex_wait);
+
+        ++samples_;
+        if (overrun_ms > 0.0)
+            ++misses_;
+        off_cpu_sum_ms_ += off_cpu_ms;
+        off_cpu_max_ms_ = std::max(off_cpu_max_ms_, off_cpu_ms);
+        overrun_max_ms_ = std::max(overrun_max_ms_, overrun_ms);
+        garbage_max_ = std::max(garbage_max_, garbage_level);
+
+        const auto now = std::chrono::steady_clock::now();
+        // Report immediately on the first sample and then approximately once
+        // per second, even if no garbage level change has occurred.
+        if (!first_report_ && now - last_report_at_ < std::chrono::seconds(1))
+            return;
+
+        std::ostringstream message;
+        message << std::fixed << std::setprecision(1)
+                << "RADIO: CPU demo metrics: target_cpu=" << target_cpu_ms
+                << "ms actual_cpu=" << actual_cpu_ms
+                << "ms wall=" << wall_ms
+                << "ms off_cpu=" << off_cpu_ms
+                << "ms cpu_share=" << cpu_share_percent
+                << "% deadline=" << deadline_ms
+                << "ms overrun=" << overrun_ms
+                << "ms mutex_wait=" << mutex_wait_ms
+                << "ms garbage=" << garbage_level << "/12"
+                << " | window samples=" << samples_
+                << " misses=" << misses_
+                << " avg_off_cpu=" << (off_cpu_sum_ms_ / samples_)
+                << "ms max_off_cpu=" << off_cpu_max_ms_
+                << "ms max_overrun=" << overrun_max_ms_
+                << "ms max_garbage=" << garbage_max_ << "/12";
+        std::cout << message.str() << std::endl;
+
+        first_report_ = false;
+        last_report_at_ = now;
+        samples_ = 0;
+        misses_ = 0;
+        off_cpu_sum_ms_ = 0.0;
+        off_cpu_max_ms_ = 0.0;
+        overrun_max_ms_ = 0.0;
+        garbage_max_ = 0;
+    }
+
+private:
+    static double to_ms(std::chrono::steady_clock::duration duration) {
+        return std::chrono::duration<double, std::milli>(duration).count();
+    }
+
+    bool first_report_ = true;
+    std::chrono::steady_clock::time_point last_report_at_{};
+    unsigned samples_ = 0;
+    unsigned misses_ = 0;
+    double off_cpu_sum_ms_ = 0.0;
+    double off_cpu_max_ms_ = 0.0;
+    double overrun_max_ms_ = 0.0;
+    unsigned garbage_max_ = 0;
+};
+
 // Insert ANSI-colored garbage at UTF-8 character boundaries. The payload is
 // capped below 256 bytes because the demo's existing string serializer uses
 // an 8-bit loop counter. Plain metadata remains unchanged when level is zero.
@@ -295,6 +372,7 @@ public:
                                    && lock_env[1] == '\0';
         unsigned garbage_level = 0;
         bool garbage_level_changed = false;
+        demo_cpu_metrics demo_metrics;
 
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
@@ -306,8 +384,11 @@ public:
         if (demo_cpu_ms > 0) {
             std::cout << "RADIO: CPU demo enabled (" << demo_cpu_ms
                       << " ms thread CPU time per cycle, mutex "
-                      << (demo_hold_mutex ? "held" : "released") << ")"
-                      << std::endl;
+                      << (demo_hold_mutex ? "held" : "released")
+                      << "; metrics approximately every 1 s)" << std::endl;
+        } else {
+            std::cout << "RADIO: CPU demo disabled; set RADIO_DEMO_CPU_MS > 0 "
+                      << "to enable workload delay metrics" << std::endl;
         }
 
         offer();
@@ -380,6 +461,15 @@ public:
                                   << std::dec << current_volume << "% volume"
                                   << std::endl;
                     }
+                    if (garbage_level_changed) {
+                        // Confirm that the new corruption level was actually
+                        // published, not merely detected by the CPU workload.
+                        std::cout << "RADIO: Republished song metadata: garbage="
+                                  << std::dec << garbage_level << "/12"
+                                  << " title_bytes=" << title.size()
+                                  << " artist_bytes=" << artist.size()
+                                  << std::endl;
+                    }
                     garbage_level_changed = false;
                 }
             } else {
@@ -398,11 +488,17 @@ public:
                     its_lock.unlock();
 
                 const auto work_started = std::chrono::steady_clock::now();
+                const std::uint64_t cpu_started_ns = thread_cpu_time_ns();
                 demo_cpu_work(demo_cpu_ms);
-                const auto work_elapsed = std::chrono::steady_clock::now() - work_started;
+                const std::uint64_t consumed_cpu_ns = thread_cpu_time_ns() - cpu_started_ns;
+                const auto work_finished = std::chrono::steady_clock::now();
+                const auto work_elapsed = work_finished - work_started;
 
                 if (!demo_hold_mutex)
                     its_lock.lock();
+                const auto mutex_wait = demo_hold_mutex
+                        ? std::chrono::steady_clock::duration::zero()
+                        : std::chrono::steady_clock::now() - work_finished;
 
                 // The demo deliberately corrupts outgoing display text after
                 // missed computation deadlines. It does not modify source data.
@@ -410,13 +506,9 @@ public:
                 if (observed_level != garbage_level) {
                     garbage_level = observed_level;
                     garbage_level_changed = true;
-                    const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            work_elapsed).count();
-                    std::cout << "RADIO: Demo computation elapsed " << wall_ms
-                              << " ms (budget " << demo_cpu_ms
-                              << " ms CPU); garbage level " << garbage_level << "/12"
-                              << std::endl;
                 }
+                demo_metrics.record(demo_cpu_ms, work_elapsed, consumed_cpu_ns,
+                                    mutex_wait, garbage_level);
 
                 // Keep the CPU load almost continuous, but briefly release
                 // the mutex to allow state updates and normal shutdown.
