@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -6,6 +7,8 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 #include <cstdlib>
 #include <condition_variable>
 #include <thread>
@@ -63,6 +66,76 @@ unsigned demo_cpu_duration_ms() {
         return 0;
     }
     return static_cast<unsigned>(parsed);
+}
+
+// This is a synthetic display fault, not a detection of real network corruption.
+// Allow 10% plus 10 ms of scheduling overhead before reporting a missed budget.
+// The number of inserted symbols rises gradually with the wall-clock overrun.
+unsigned demo_garbage_level(unsigned cpu_ms, std::chrono::steady_clock::duration elapsed) {
+    if (cpu_ms == 0)
+        return 0;
+
+    const double wall_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+    const double tolerance_ms = static_cast<double>(cpu_ms) * 0.10 + 10.0;
+    const double late_ms = wall_ms - static_cast<double>(cpu_ms) - tolerance_ms;
+    if (late_ms <= 0.0)
+        return 0;
+
+    const double relative_delay = late_ms / static_cast<double>(cpu_ms);
+    const double scaled = 12.0 * relative_delay / (relative_delay + 1.5);
+    return std::min(12u, 1u + static_cast<unsigned>(scaled));
+}
+
+// Insert ANSI-colored garbage at UTF-8 character boundaries. The payload is
+// capped below 256 bytes because the demo's existing string serializer uses
+// an 8-bit loop counter. Plain metadata remains unchanged when level is zero.
+std::string demo_corrupt_text(const std::string &original, unsigned level, unsigned seed) {
+    if (level == 0 || original.empty())
+        return original;
+
+    constexpr std::size_t max_payload_bytes = 240;
+    constexpr std::size_t bytes_per_symbol = 12; // ANSI color + ASCII symbol + reset
+    if (original.size() >= max_payload_bytes)
+        return original;
+
+    const std::size_t count = std::min<std::size_t>(
+            level, (max_payload_bytes - original.size()) / bytes_per_symbol);
+    if (count == 0)
+        return original;
+
+    const char *const colors[] = {"\x1b[1;31m", "\x1b[1;35m", "\x1b[1;33m"};
+    const char symbols[] = {'#', '@', '%', '&', '?', '!', '*', '~'};
+    const char *const reset = "\x1b[0m";
+
+    // Collect ends of UTF-8 code points to avoid inserting escape sequences
+    // in the middle of a multibyte character.
+    std::vector<std::size_t> boundaries;
+    for (std::size_t pos = 0; pos < original.size();) {
+        ++pos;
+        while (pos < original.size()
+                && (static_cast<unsigned char>(original[pos]) & 0xc0) == 0x80)
+            ++pos;
+        boundaries.push_back(pos);
+    }
+
+    std::string result;
+    result.reserve(original.size() + count * bytes_per_symbol);
+    std::size_t previous = 0;
+    std::size_t inserted = 0;
+    for (std::size_t i = 0; i < boundaries.size(); ++i) {
+        result.append(original, previous, boundaries[i] - previous);
+        previous = boundaries[i];
+
+        // Distribute the extra characters across the full title/artist.
+        while (inserted < count
+                && 1 + inserted * boundaries.size() / count == i + 1) {
+            result += colors[(seed + static_cast<unsigned>(inserted)) % 3];
+            result += symbols[(seed + static_cast<unsigned>(inserted)) % sizeof(symbols)];
+            result += reset;
+            ++inserted;
+        }
+    }
+    return result;
 }
 
 } // namespace
@@ -220,6 +293,8 @@ public:
         const char *lock_env = std::getenv("RADIO_DEMO_HOLD_MUTEX");
         const bool demo_hold_mutex = lock_env != nullptr && lock_env[0] == '1'
                                    && lock_env[1] == '\0';
+        unsigned garbage_level = 0;
+        bool garbage_level_changed = false;
 
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
@@ -289,15 +364,23 @@ public:
                     display = true;
                 }
 
-                if (display) {
+                if (display || garbage_level_changed) {
                     struct song_info_t *song = &station_info->songs[current_song];
-                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_SONG_EVENT_ID, payload_with_string (song->name));
-                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_ARTIST_EVENT_ID, payload_with_string (song->artist));
-                    std::cout << "RADIO: Playing song \""
-                              << song->name << "\" by " << song->artist
-                              << " (on " << station_info->name << ") "
-                              << std::dec << current_volume << "% volume"
-                              << std::endl;
+                    const std::string title = demo_corrupt_text(song->name, garbage_level, current_song);
+                    const std::string artist = demo_corrupt_text(song->artist, garbage_level,
+                            current_song + current_station + 3);
+                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_SONG_EVENT_ID,
+                            payload_with_string(title));
+                    app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_ARTIST_EVENT_ID,
+                            payload_with_string(artist));
+                    if (display) {
+                        std::cout << "RADIO: Playing song \""
+                                  << song->name << "\" by " << song->artist
+                                  << " (on " << station_info->name << ") "
+                                  << std::dec << current_volume << "% volume"
+                                  << std::endl;
+                    }
+                    garbage_level_changed = false;
                 }
             } else {
                 if (currently_playing)
@@ -314,10 +397,26 @@ public:
                 if (!demo_hold_mutex)
                     its_lock.unlock();
 
+                const auto work_started = std::chrono::steady_clock::now();
                 demo_cpu_work(demo_cpu_ms);
+                const auto work_elapsed = std::chrono::steady_clock::now() - work_started;
 
                 if (!demo_hold_mutex)
                     its_lock.lock();
+
+                // The demo deliberately corrupts outgoing display text after
+                // missed computation deadlines. It does not modify source data.
+                const unsigned observed_level = demo_garbage_level(demo_cpu_ms, work_elapsed);
+                if (observed_level != garbage_level) {
+                    garbage_level = observed_level;
+                    garbage_level_changed = true;
+                    const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            work_elapsed).count();
+                    std::cout << "RADIO: Demo computation elapsed " << wall_ms
+                              << " ms (budget " << demo_cpu_ms
+                              << " ms CPU); garbage level " << garbage_level << "/12"
+                              << std::endl;
+                }
 
                 // Keep the CPU load almost continuous, but briefly release
                 // the mutex to allow state updates and normal shutdown.
