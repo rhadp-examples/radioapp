@@ -8,7 +8,7 @@ Source0:        auto-apps-%{version}.tar.gz
 # Define the SELinux policy type enforcement file as the second source
 Source1:        auto-apps.te
 
-BuildRequires:  cmake make gcc-c++ boost-devel vsomeip3-devel
+BuildRequires:  cmake make gcc-c++ boost-devel vsomeip3-devel ncurses-devel
 # Required tools to compile the SELinux policy from source
 BuildRequires:  checkpolicy policycoreutils
 
