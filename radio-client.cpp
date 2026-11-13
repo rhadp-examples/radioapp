@@ -25,6 +25,7 @@
 
 #include "radio-client-state.hpp"
 #include "services.hpp"
+#include "demo-health.hpp"
 
 namespace {
 
@@ -88,6 +89,16 @@ void on_engine_reverse_event(const std::shared_ptr<vsomeip::message> &event) {
     update_state([&](ClientState &s) { s.reverse_event(reversed); });
 }
 
+void on_engine_health_event(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    if (!payload)
+        return;
+    demo_health::Message message;
+    if (!demo_health::decode(payload->get_data(), payload->get_length(), message))
+        return;
+    update_state([&](ClientState &s) { s.engine_health_event(message); });
+}
+
 void request_radio_events() {
     app->register_message_handler(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
                                   RADIO_VOLUME_EVENT_ID, on_volume_message);
@@ -110,10 +121,18 @@ void request_radio_events() {
 void request_engine_events() {
     app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                                   ENGINE_REVERSE_EVENT_ID, on_engine_reverse_event);
-    const std::set<vsomeip::eventgroup_t> groups{ENGINE_EVENTGROUP_ID};
+    app->register_message_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                                  ENGINE_HEALTH_EVENT_ID, on_engine_health_event);
+    const std::set<vsomeip::eventgroup_t> reverse_group{ENGINE_EVENTGROUP_ID};
     app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
-                       ENGINE_REVERSE_EVENT_ID, groups, vsomeip::event_type_e::ET_FIELD);
+                       ENGINE_REVERSE_EVENT_ID, reverse_group,
+                       vsomeip::event_type_e::ET_FIELD);
+    const std::set<vsomeip::eventgroup_t> health_group{ENGINE_HEALTH_EVENTGROUP_ID};
+    app->request_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
+                       ENGINE_HEALTH_EVENT_ID, health_group,
+                       vsomeip::event_type_e::ET_FIELD);
     app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
+    app->subscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
 }
 
 bool setup_vsomeip() {
@@ -348,13 +367,16 @@ private:
     void draw_status(int row, int cols, const ClientState &s) const {
         int x = 1;
         const int limit = cols - 1;
+        const bool narrow = cols < 44;
         auto token = [&](const std::string &value, int pair, bool bold = false) {
             if (x >= limit)
                 return;
             draw_text(row, x, limit - x, value, pair, bold);
             x += static_cast<int>(value.size());
         };
-        auto sep = [&]() { token(" | ", PairMuted); };
+        auto sep = [&]() { token(narrow ? " " : " | ", PairMuted); };
+        const char *cpu_label = narrow ? "C!" : " CPU!";
+        const char *ram_label = narrow ? "M!" : " RAM!";
 
         if (s.engine.availability != Availability::Available ||
             s.direction == Direction::Unknown) {
@@ -366,24 +388,16 @@ private:
         }
         sep();
         draw_service_status(token, "R", s.radio);
+        if (s.radio.cpu.state == Health::Degraded || s.radio.cpu.state == Health::Failed)
+            token(cpu_label, PairWarning, true);
+        if (s.radio.ram.state == Health::Degraded || s.radio.ram.state == Health::Failed)
+            token(ram_label, PairError, true);
         sep();
         draw_service_status(token, "E", s.engine);
-        if (s.radio.cpu.state == Health::Degraded || s.radio.cpu.state == Health::Failed) {
-            sep();
-            token("R:CPU!", PairWarning, true);
-        }
-        if (s.radio.ram.state == Health::Degraded || s.radio.ram.state == Health::Failed) {
-            sep();
-            token("R:RAM!", PairError, true);
-        }
-        if (s.engine.cpu.state == Health::Degraded || s.engine.cpu.state == Health::Failed) {
-            sep();
-            token("E:CPU!", PairWarning, true);
-        }
-        if (s.engine.ram.state == Health::Degraded || s.engine.ram.state == Health::Failed) {
-            sep();
-            token("E:RAM!", PairError, true);
-        }
+        if (s.engine.cpu.state == Health::Degraded || s.engine.cpu.state == Health::Failed)
+            token(cpu_label, PairWarning, true);
+        if (s.engine.ram.state == Health::Degraded || s.engine.ram.state == Health::Failed)
+            token(ram_label, PairError, true);
     }
 
     template <typename Add>
@@ -509,7 +523,7 @@ private:
         }
         if (rows >= 20) {
             draw_text(19, 1, cols - 2,
-                      "'demo' = inferred from metadata; -- = no SOME/IP telemetry", PairMuted);
+                      "Radio demo status is inferred; Engine status uses health telemetry", PairMuted);
         }
     }
 
@@ -590,6 +604,7 @@ int main() {
             ClientState snapshot;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
+                state.refresh_engine_health(std::chrono::steady_clock::now());
                 snapshot = state;
             }
             const auto now = std::chrono::steady_clock::now();
@@ -606,6 +621,10 @@ int main() {
         vsomeip_thread.join();
         app->clear_all_handler();
         app->release_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
+        app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
+        app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);
+        app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENT_ID);
+        app->release_event(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_REVERSE_EVENT_ID);
         app->release_service(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID);
 
     } // Restore the terminal before the original DLT shutdown workaround.

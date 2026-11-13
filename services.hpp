@@ -26,6 +26,10 @@
 
 #define ENGINE_EVENTGROUP_ID 0x4002
 #define ENGINE_REVERSE_EVENT_ID 0x8000 + 1
+// Demo-only health event uses a separate eventgroup, so radio-service does
+// not receive diagnostic traffic when it subscribes to reverse events.
+#define ENGINE_HEALTH_EVENTGROUP_ID 0x4003
+#define ENGINE_HEALTH_EVENT_ID 0x8000 + 2
 
 static uint32_t inline
 payload_get_arg(std::shared_ptr<vsomeip::payload> its_payload)

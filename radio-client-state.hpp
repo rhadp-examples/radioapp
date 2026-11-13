@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "demo-health.hpp"
+
 // Independent of vsomeip and ncurses so the state model can be tested alone.
 namespace radio_ui {
 
@@ -18,6 +20,16 @@ enum class Health { Unknown, Normal, Degraded, Failed };
 enum class Evidence { None, DemoIndicator, Telemetry };
 enum class Direction { Unknown, Forward, Reverse };
 enum class TextColor { Default, Red, Yellow, Magenta };
+
+inline Health health_from_wire(demo_health::Level value) {
+    switch (value) {
+    case demo_health::Level::Normal: return Health::Normal;
+    case demo_health::Level::Degraded: return Health::Degraded;
+    case demo_health::Level::Failed: return Health::Failed;
+    case demo_health::Level::Unknown: return Health::Unknown;
+    }
+    return Health::Unknown;
+}
 
 struct CpuMetrics {
     bool available = false;
@@ -185,6 +197,52 @@ struct ClientState {
     bool title_colored = false;
     bool artist_colored = false;
     std::uint64_t generation = 0;
+    bool engine_health_seen = false;
+    std::chrono::steady_clock::time_point engine_health_at{};
+    std::uint32_t engine_health_sequence = 0;
+
+    void engine_health_event(const demo_health::Message &message) {
+        if (engine.availability == Availability::Unavailable)
+            return;
+        CpuMetrics cpu_metrics;
+        cpu_metrics.available = message.cpu_metrics_valid;
+        if (cpu_metrics.available) {
+            cpu_metrics.cpu_share_percent = message.cpu_share_centi_percent / 100.0;
+            cpu_metrics.wall_ms = message.cpu_wall_ms;
+            cpu_metrics.off_cpu_ms = message.cpu_off_ms;
+            cpu_metrics.deadline_overrun_ms = message.cpu_overrun_ms;
+            cpu_metrics.deadline_misses = message.cpu_deadline_misses;
+        }
+        RamMetrics ram_metrics;
+        ram_metrics.available = message.ram_metrics_valid;
+        if (ram_metrics.available) {
+            ram_metrics.requested_bytes = message.ram_requested_bytes;
+            ram_metrics.allocated_bytes = message.ram_allocated_bytes;
+            ram_metrics.allocation_failures = message.ram_allocation_failures;
+        }
+        engine.update_cpu(health_from_wire(message.cpu), cpu_metrics);
+        engine.update_ram(health_from_wire(message.ram), ram_metrics);
+        engine_health_at = std::chrono::steady_clock::now();
+        engine_health_seen = true;
+        engine_health_sequence = message.sequence;
+        ++generation;
+    }
+
+    void refresh_engine_health(std::chrono::steady_clock::time_point now) {
+        // The engine heartbeat is expected once a second. Do not display
+        // old health values as live telemetry after communication stalls.
+        if (!engine_health_seen || engine.availability != Availability::Available)
+            return;
+        if (now - engine_health_at > std::chrono::seconds(4) &&
+            engine.communication != Communication::Stale) {
+            engine.communication = Communication::Stale;
+            engine.cpu = HealthAxis{};
+            engine.ram = HealthAxis{};
+            engine.cpu_metrics = CpuMetrics{};
+            engine.ram_metrics = RamMetrics{};
+            ++generation;
+        }
+    }
 
     void cpu_health_event(ServiceKind service, Health value, const CpuMetrics &metrics) {
         (service == ServiceKind::Radio ? radio : engine).update_cpu(value, metrics);
@@ -212,8 +270,10 @@ struct ClientState {
 
     void engine_availability(bool online) {
         engine.on_availability(online);
-        if (!online)
+        if (!online) {
             direction = Direction::Unknown;
+            engine_health_seen = false;
+        }
         ++generation;
     }
 
@@ -276,6 +336,7 @@ struct ClientState {
         direction = reversing ? Direction::Reverse : Direction::Forward;
         last_known_direction = direction;
         engine.observe_message();
+        refresh_engine_health(std::chrono::steady_clock::now());
         ++generation;
     }
 

@@ -26,14 +26,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(radio-service radio-service.cpp services.hpp radio-stations.cpp)
 target_link_libraries(radio-service  vsomeip3 ${Boost_LIBRARIES})
 
-add_executable(radio-client radio-client.cpp services.hpp)
+add_executable(radio-client radio-client.cpp radio-client-state.hpp demo-health.hpp services.hpp)
 target_include_directories(radio-client PRIVATE ${CURSES_INCLUDE_DIRS})
 target_link_libraries(radio-client  vsomeip3 ${Boost_LIBRARIES} ${CURSES_LIBRARIES})
 
-add_executable(engine-service engine-service.cpp services.hpp)
+add_executable(engine-service engine-service.cpp services.hpp demo-health.hpp engine-demo-memory.hpp)
 target_link_libraries(engine-service  vsomeip3 ${Boost_LIBRARIES})
 
 install (
     TARGETS radio-service radio-client engine-service
     RUNTIME DESTINATION "${INSTALL_BIN_DIR}" COMPONENT bin
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(demo-health-test tests/demo-health-test.cpp
+                   demo-health.hpp engine-demo-memory.hpp radio-client-state.hpp)
+    target_include_directories(demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME demo-health-test COMMAND demo-health-test)
+endif()
