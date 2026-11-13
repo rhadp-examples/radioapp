@@ -5,28 +5,71 @@ Summary:        Sample auto apps
 
 License:        MIT
 Source0:        auto-apps-%{version}.tar.gz
+# Define the SELinux policy type enforcement file as the second source
+Source1:        auto-apps.te
 
-
-BuildRequires:  cmake make gcc-c++ boost-devel vsomeip3-devel
+BuildRequires:  cmake make gcc-c++ boost-devel vsomeip3-devel ncurses-devel
+# Required tools to compile the SELinux policy from source
+BuildRequires:  checkpolicy policycoreutils
 
 %description
 Sample auto applications
 
+# --- SELinux Subpackage Definition ---
+%package selinux
+Summary:        Custom SELinux policy module for auto-apps
+License:        GPLv2+
+BuildArch:      noarch
+Requires:       %{name} = %{version}-%{release}
+Requires:       selinux-policy >= %{_selinux_policy_version}
+Requires(post): policycoreutils, selinux-policy-automotive
+Requires(postun): policycoreutils
+
+%description selinux
+This package installs and loads the custom SELinux policy module for auto-apps.
+# -------------------------------------
+
 %prep
 %autosetup
+
+# Copy the SELinux policy source into the build directory
+cp -p %{SOURCE1} .
 
 %build
 %cmake
 %cmake_build
 
+# Build the SELinux policy module from the .te source
+checkmodule -M -m -o auto-apps.mod auto-apps.te
+semodule_package -o auto-apps.pp -m auto-apps.mod
+
 %install
 %cmake_install
+
+# Install SELinux policy
+mkdir -p %{buildroot}%{_datadir}/selinux/packages/automotive
+install -m 0644 auto-apps.pp %{buildroot}%{_datadir}/selinux/packages/automotive/auto-apps.pp
+
+%post selinux
+# 1. Load policy module into SELinux
+/usr/sbin/semodule -i %{_datadir}/selinux/packages/automotive/auto-apps.pp &> /dev/null || :
+
+# 2. Apply file contexts to affected directories/files
+/usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service &> /dev/null || :
+
+%postun selinux
+if [ $1 -eq 0 ]; then
+    # If the package is completely uninstalled: remove module
+    /usr/sbin/semodule -r auto-apps &> /dev/null || :
+    # Reset context to default
+    /usr/sbin/restorecon -R %{_bindir}/engine-service %{_bindir}/radio-client %{_bindir}/radio-service &> /dev/null || :
+fi
 
 %files
 %{_bindir}/engine-service
 %{_bindir}/radio-client
 %{_bindir}/radio-service
 
-%changelog
-* Mon Mar 14 2022 Alexander Larsson <alexl@redhat.com>
-- Initial version
+%files selinux
+%attr(0644,root,root) %{_datadir}/selinux/packages/automotive/auto-apps.pp
+

@@ -1,15 +1,50 @@
-VERSION=0.1
-
+VERSION=0.3
 TOPDIR=$(shell pwd)
 
+# --- global release number calculation for the current build ---
+# ---          start with 1 for each new tagged version       ---
+LAST_TAG=$(shell git describe --tags --abbrev=0 HEAD 2>/dev/null)
+ifeq ($(LAST_TAG),)
+    # Fallback: Keine Tags da -> Absolute Commit-Anzahl
+    RELEASE=$(shell git rev-list --count HEAD)
+else
+    RELEASE=$(shell echo $$(($$(git rev-list --count $(LAST_TAG)..HEAD) + 1)))
+endif
+# ----------------------------------------------------------
+
+.PHONY: srpm rpm clean
+
 auto-apps-$(VERSION).tar.gz:
-	git archive HEAD . --prefix=auto-apps-$(VERSION)/ --output=auto-apps-$(VERSION).tar.gz
+	git archive HEAD . --prefix=auto-apps-$(VERSION)/ --output=$@
 
+auto-apps.spec: auto-apps.spec.in
+	sed 's/@@VERSION@@/$(VERSION)/g' $< > $@
+	sed -i 's/^Release:.*/Release:        $(RELEASE)%{?dist}/' $@
+	echo "" >> $@
+	echo "%changelog" >> $@
+	# generate changelog entries based on git log using the tagged version and release as calculated
+	LC_ALL=C git log -n 10 --no-merges --format="%H|%cd|%aN <%aE>|%s" --date=format:"%a %b %d %Y" | \
+	while IFS='|' read -r hash date author msg; do \
+		c_tag=$$(git describe --tags --abbrev=0 $$hash 2>/dev/null); \
+		if [ -z "$$c_tag" ]; then \
+			c_ver="0.1"; \
+			c_rel=$$(git rev-list --count $$hash); \
+		else \
+			c_ver=$$(echo "$$c_tag" | sed 's/^[vV]//'); \
+			commits_since=$$(git rev-list --count $$c_tag..$$hash); \
+			c_rel=$$((commits_since + 1)); \
+		fi; \
+		echo "* $$date $$author - $$c_ver-$$c_rel"; \
+		echo "- $$msg"; \
+		echo ""; \
+	done >> $@
 
-srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
-	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
-	rpmbuild -bs --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
+srpm: auto-apps-$(VERSION).tar.gz auto-apps.spec
+	rpmbuild -bs --define "_srcrpmdir $(TOPDIR)" --define "_sourcedir $(TOPDIR)" auto-apps.spec
 
-rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec.in
-	sed s/@@VERSION@@/$(VERSION)/g auto-apps.spec.in > auto-apps.spec
-	rpmbuild -ba --define "_srcrpmdir $(TOPDIR)"  --define "_sourcedir $(TOPDIR)" auto-apps.spec
+rpm: auto-apps-$(VERSION).tar.gz auto-apps.spec
+	rpmbuild -ba --define "_rpmdir $(TOPDIR)" --define "_srcrpmdir $(TOPDIR)" --define "_sourcedir $(TOPDIR)" auto-apps.spec
+
+clean:
+	rm -f auto-apps.spec auto-apps-*.tar.gz
+	rm -rf $(TOPDIR)/auto-apps*.rpm $(TOPDIR)/auto-apps*.srpm
