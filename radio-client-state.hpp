@@ -193,39 +193,63 @@ struct ClientState {
     bool volume_received = false;
     std::uint32_t volume = 0;
     bool ram_warning = false;
+    bool ram_warning_from_station = false;
     unsigned demo_colored_symbols = 0;
     bool title_colored = false;
     bool artist_colored = false;
     std::uint64_t generation = 0;
+    bool radio_health_seen = false;
+    std::chrono::steady_clock::time_point radio_health_at{};
+    std::uint32_t radio_health_sequence = 0;
     bool engine_health_seen = false;
     std::chrono::steady_clock::time_point engine_health_at{};
     std::uint32_t engine_health_sequence = 0;
 
+    void radio_health_event(const demo_health::Message &message) {
+        if (radio.availability == Availability::Unavailable)
+            return;
+        apply_health(radio, message);
+        radio_health_at = std::chrono::steady_clock::now();
+        radio_health_seen = true;
+        radio_health_sequence = message.sequence;
+        // An explicit recovered RAM state supersedes an old station marker.
+        // The marker is only a fallback when no valid RAM state is available.
+        ram_warning = radio.ram.state == Health::Failed ||
+                (radio.ram.state == Health::Unknown && ram_warning_from_station);
+        ++generation;
+    }
+
     void engine_health_event(const demo_health::Message &message) {
         if (engine.availability == Availability::Unavailable)
             return;
-        CpuMetrics cpu_metrics;
-        cpu_metrics.available = message.cpu_metrics_valid;
-        if (cpu_metrics.available) {
-            cpu_metrics.cpu_share_percent = message.cpu_share_centi_percent / 100.0;
-            cpu_metrics.wall_ms = message.cpu_wall_ms;
-            cpu_metrics.off_cpu_ms = message.cpu_off_ms;
-            cpu_metrics.deadline_overrun_ms = message.cpu_overrun_ms;
-            cpu_metrics.deadline_misses = message.cpu_deadline_misses;
-        }
-        RamMetrics ram_metrics;
-        ram_metrics.available = message.ram_metrics_valid;
-        if (ram_metrics.available) {
-            ram_metrics.requested_bytes = message.ram_requested_bytes;
-            ram_metrics.allocated_bytes = message.ram_allocated_bytes;
-            ram_metrics.allocation_failures = message.ram_allocation_failures;
-        }
-        engine.update_cpu(health_from_wire(message.cpu), cpu_metrics);
-        engine.update_ram(health_from_wire(message.ram), ram_metrics);
+        apply_health(engine, message);
         engine_health_at = std::chrono::steady_clock::now();
         engine_health_seen = true;
         engine_health_sequence = message.sequence;
         ++generation;
+    }
+
+    void refresh_radio_health(std::chrono::steady_clock::time_point now) {
+        if (!radio_health_seen || radio.availability != Availability::Available)
+            return;
+        if (now - radio_health_at > std::chrono::seconds(4) &&
+            (radio.cpu.source == Evidence::Telemetry ||
+             radio.ram.source == Evidence::Telemetry)) {
+            // Metadata may continue to arrive while the health heartbeat is
+            // missing. Retire old measurements rather than showing them as live.
+            radio.communication = Communication::Stale;
+            radio.cpu = HealthAxis{};
+            radio.ram = HealthAxis{};
+            radio.cpu_metrics = CpuMetrics{};
+            radio.ram_metrics = RamMetrics{};
+            if (station_received) {
+                radio.ram = {ram_warning_from_station ? Health::Failed : Health::Normal,
+                             Evidence::DemoIndicator};
+            }
+            ram_warning = ram_warning_from_station;
+            refresh_cpu_demo_indicator();
+            ++generation;
+        }
     }
 
     void refresh_engine_health(std::chrono::steady_clock::time_point now) {
@@ -258,6 +282,8 @@ struct ClientState {
         radio.on_availability(online);
         if (!online) {
             ram_warning = false;
+            ram_warning_from_station = false;
+            radio_health_seen = false;
             station_received = title_received = artist_received = volume_received = false;
             title_colored = artist_colored = false;
             demo_colored_symbols = 0;
@@ -283,15 +309,17 @@ struct ClientState {
         station = value;
         station_received = true;
         radio.observe_message();
-        if (value == ram_marker) {
-            ram_warning = true;
-            radio.ram = {Health::Failed, Evidence::DemoIndicator};
+        ram_warning_from_station = value == ram_marker;
+        if (ram_warning_from_station) {
+            if (radio.ram.source != Evidence::Telemetry)
+                radio.ram = {Health::Failed, Evidence::DemoIndicator};
         } else {
-            ram_warning = false;
             last_good_station = value;
-            if (radio.ram.source == Evidence::DemoIndicator)
+            if (radio.ram.source != Evidence::Telemetry)
                 radio.ram = {Health::Normal, Evidence::DemoIndicator};
         }
+        ram_warning = radio.ram.state == Health::Failed ||
+                (radio.ram.state == Health::Unknown && ram_warning_from_station);
         ++generation;
     }
 
@@ -341,6 +369,27 @@ struct ClientState {
     }
 
 private:
+    static void apply_health(ServiceStatus &service, const demo_health::Message &message) {
+        CpuMetrics cpu_metrics;
+        cpu_metrics.available = message.cpu_metrics_valid;
+        if (cpu_metrics.available) {
+            cpu_metrics.cpu_share_percent = message.cpu_share_centi_percent / 100.0;
+            cpu_metrics.wall_ms = message.cpu_wall_ms;
+            cpu_metrics.off_cpu_ms = message.cpu_off_ms;
+            cpu_metrics.deadline_overrun_ms = message.cpu_overrun_ms;
+            cpu_metrics.deadline_misses = message.cpu_deadline_misses;
+        }
+        RamMetrics ram_metrics;
+        ram_metrics.available = message.ram_metrics_valid;
+        if (ram_metrics.available) {
+            ram_metrics.requested_bytes = message.ram_requested_bytes;
+            ram_metrics.allocated_bytes = message.ram_allocated_bytes;
+            ram_metrics.allocation_failures = message.ram_allocation_failures;
+        }
+        service.update_cpu(health_from_wire(message.cpu), cpu_metrics);
+        service.update_ram(health_from_wire(message.ram), ram_metrics);
+    }
+
     void refresh_cpu_demo_indicator() {
         demo_colored_symbols =
                 parse_styled_text(title).colored_symbols +

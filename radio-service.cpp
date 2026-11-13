@@ -28,6 +28,7 @@ using namespace std::literals::chrono_literals;
 
 #include "services.hpp"
 #include "radio-stations.hpp"
+#include "radio-demo-health.hpp"
 
 namespace {
 
@@ -207,6 +208,10 @@ public:
         allocated_bytes_ = 0;
     }
 
+    std::uint64_t allocated_bytes() const {
+        return allocated_bytes_;
+    }
+
     bool acquire(std::uint64_t requested, std::string &reason,
                  std::uint64_t &bytes_before_rollback) {
         release();
@@ -315,18 +320,15 @@ unsigned demo_garbage_level(unsigned cpu_ms, std::chrono::steady_clock::duration
 // stalls; it should not be interpreted as an exact scheduler latency metric.
 class demo_cpu_metrics {
 public:
-    void record(unsigned target_cpu_ms,
-                std::chrono::steady_clock::duration work_elapsed,
-                std::uint64_t consumed_cpu_ns,
+    void record(unsigned target_cpu_ms, const radio_demo::CpuSample &sample,
                 std::chrono::steady_clock::duration mutex_wait,
                 unsigned garbage_level) {
-        const double wall_ms = to_ms(work_elapsed);
-        const double actual_cpu_ms = static_cast<double>(consumed_cpu_ns) / 1000000.0;
-        const double off_cpu_ms = std::max(0.0, wall_ms - actual_cpu_ms);
-        const double cpu_share_percent = wall_ms > 0.0
-                ? 100.0 * actual_cpu_ms / wall_ms : 0.0;
-        const double deadline_ms = static_cast<double>(target_cpu_ms) * 1.10 + 10.0;
-        const double overrun_ms = std::max(0.0, wall_ms - deadline_ms);
+        const double wall_ms = sample.wall_ms;
+        const double actual_cpu_ms = sample.cpu_ms;
+        const double off_cpu_ms = sample.off_cpu_ms;
+        const double cpu_share_percent = sample.cpu_share_percent;
+        const double deadline_ms = sample.deadline_ms;
+        const double overrun_ms = sample.overrun_ms;
         const double mutex_wait_ms = to_ms(mutex_wait);
 
         ++samples_;
@@ -526,6 +528,13 @@ public:
                 its_groups_radio,
                 vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
                 false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
+        app->offer_event(
+                RADIO_SERVICE_ID,
+                RADIO_INSTANCE_ID,
+                RADIO_HEALTH_EVENT_ID,
+                std::set<vsomeip::eventgroup_t>{RADIO_HEALTH_EVENTGROUP_ID},
+                vsomeip::event_type_e::ET_FIELD, std::chrono::milliseconds::zero(),
+                false, true, nullptr, vsomeip::reliability_type_e::RT_UNKNOWN);
 
         app->register_availability_handler(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID,
                 std::bind(&radio_service::on_engine_availability, this,
@@ -601,6 +610,9 @@ public:
         demo_ram_buffer ram_working_set;
         demo_ram_warning_state ram_warning;
         bool ram_warning_displayed = false;
+        radio_demo::HealthTracker health_tracker(demo_cpu_ms, demo_ram_bytes);
+        auto next_health_report = std::chrono::steady_clock::now();
+        std::uint32_t health_sequence = 0;
 
         std::unique_lock<std::mutex> its_lock(main_mutex);
         std::cout << "RADIO: Started main thread" << std::endl;
@@ -629,6 +641,25 @@ public:
         }
 
         offer();
+
+        // The health field also serves as a one-second heartbeat. In normal
+        // operation no journal parsing or metadata inference is required.
+        const auto publish_health = [&](bool force) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && now < next_health_report)
+                return;
+            health_tracker.refresh_ram(ram_working_set.allocated_bytes(),
+                                       ram_warning.active(now));
+            auto health = health_tracker.snapshot(now);
+            // Change the sequence even if the measured values remain stable.
+            health.sequence = ++health_sequence;
+            auto payload = vsomeip::runtime::get()->create_payload();
+            payload->set_data(demo_health::encode(health));
+            app->notify(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                        RADIO_HEALTH_EVENT_ID, payload);
+            next_health_report = now + std::chrono::seconds(1);
+        };
+        publish_health(true);
 
         while (main_running) {
             bool display = false;
@@ -718,12 +749,19 @@ public:
                                          "after the latest allocation failure"
                                       << std::endl;
                         }
+                        health_tracker.record_ram_allocation(
+                                acquired, ram_working_set.allocated_bytes(),
+                                ram_warning.active(std::chrono::steady_clock::now()));
+                        // Publish the allocation result immediately, before a
+                        // potentially long CPU workload can delay the warning.
+                        publish_health(true);
 
                         // An intervening station or playback request makes the
                         // just-prepared song obsolete. Preserve any RAM warning
                         // that was already triggered while retrying the request.
                         if (!next_playing || next_radio_station != current_station) {
                             ram_working_set.release();
+                            publish_health(true);
                             goto_next_song = true;
                             continue;
                         }
@@ -839,8 +877,9 @@ public:
                     garbage_level = observed_level;
                     garbage_level_changed = true;
                 }
-                demo_metrics.record(demo_cpu_ms, work_elapsed, consumed_cpu_ns,
-                                    mutex_wait, garbage_level);
+                const auto cpu_sample = health_tracker.record_cpu(
+                        work_elapsed, consumed_cpu_ns, std::chrono::steady_clock::now());
+                demo_metrics.record(demo_cpu_ms, cpu_sample, mutex_wait, garbage_level);
 
                 // Keep the CPU load almost continuous, but briefly release
                 // the mutex to allow state updates and normal shutdown.
@@ -849,6 +888,7 @@ public:
                 // Preserve song changes despite replacing the original wait.
                 if (next_playing && std::chrono::system_clock::now() >= next_song_at)
                     goto_next_song = true;
+                publish_health(false);
             } else {
                 // While the RAM warning is visible, wake periodically so its
                 // 15-second hold can end without waiting for another song.
@@ -858,14 +898,24 @@ public:
                     if (next_playing && std::chrono::system_clock::now() >= next_song_at)
                         goto_next_song = true;
                 } else if (!next_playing) {
-                    // Preserve the original idle behavior outside demo errors.
-                    main_condition.wait(its_lock, [this] {
-                        return !main_running || next_playing;
-                    });
-                } else if (main_condition.wait_until(its_lock, next_song_at)
-                        == std::cv_status::timeout) {
-                    goto_next_song = true;
+                    // Continue the health heartbeat while playback is paused.
+                    main_condition.wait_until(its_lock, next_health_report);
+                } else {
+                    // Wake for either a song transition or the health heartbeat.
+                    // The two deadlines use different clocks, so compare their
+                    // remaining durations rather than their time points.
+                    const auto song_wait = std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                            next_song_at - std::chrono::system_clock::now());
+                    const auto health_wait = next_health_report -
+                            std::chrono::steady_clock::now();
+                    const auto wait = std::min(song_wait, health_wait);
+                    if (wait > std::chrono::steady_clock::duration::zero())
+                        main_condition.wait_for(its_lock, wait);
+                    if (next_playing && std::chrono::system_clock::now() >= next_song_at)
+                        goto_next_song = true;
                 }
+                publish_health(false);
             }
         }
     }

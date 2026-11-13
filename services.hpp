@@ -18,6 +18,9 @@
 #define RADIO_STATION_EVENT_ID 0x8000 + 2
 #define RADIO_SONG_EVENT_ID 0x8000 + 3
 #define RADIO_ARTIST_EVENT_ID 0x8000 + 4
+// Demo-only health telemetry is separate from the radio metadata eventgroup.
+#define RADIO_HEALTH_EVENTGROUP_ID 0x4004
+#define RADIO_HEALTH_EVENT_ID 0x8000 + 5
 
 #define ENGINE_SERVICE_ID 0x1001
 #define ENGINE_INSTANCE_ID 1

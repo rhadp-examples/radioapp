@@ -89,6 +89,16 @@ void on_engine_reverse_event(const std::shared_ptr<vsomeip::message> &event) {
     update_state([&](ClientState &s) { s.reverse_event(reversed); });
 }
 
+void on_radio_health_event(const std::shared_ptr<vsomeip::message> &event) {
+    const auto payload = event->get_payload();
+    if (!payload)
+        return;
+    demo_health::Message message;
+    if (!demo_health::decode(payload->get_data(), payload->get_length(), message))
+        return;
+    update_state([&](ClientState &s) { s.radio_health_event(message); });
+}
+
 void on_engine_health_event(const std::shared_ptr<vsomeip::message> &event) {
     const auto payload = event->get_payload();
     if (!payload)
@@ -116,6 +126,14 @@ void request_radio_events() {
                            vsomeip::event_type_e::ET_FIELD);
     }
     app->subscribe(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_EVENTGROUP_ID);
+
+    app->register_message_handler(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                                  RADIO_HEALTH_EVENT_ID, on_radio_health_event);
+    const std::set<vsomeip::eventgroup_t> health_group{RADIO_HEALTH_EVENTGROUP_ID};
+    app->request_event(RADIO_SERVICE_ID, RADIO_INSTANCE_ID,
+                       RADIO_HEALTH_EVENT_ID, health_group,
+                       vsomeip::event_type_e::ET_FIELD);
+    app->subscribe(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_HEALTH_EVENTGROUP_ID);
 }
 
 void request_engine_events() {
@@ -466,6 +484,18 @@ private:
         return out.str();
     }
 
+    static std::string health_age_text(bool seen,
+                    std::chrono::steady_clock::time_point time) {
+        if (!seen)
+            return "--";
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - time).count();
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(1)
+            << std::max<std::int64_t>(0, age) / 1000.0 << "s ago";
+        return out.str();
+    }
+
     static std::string cpu_text(const ServiceStatus &service, bool share) {
         if (!service.cpu_metrics.available)
             return "--";
@@ -521,9 +551,17 @@ private:
                 direction = std::string(direction_text(s.last_known_direction)) + " (last)";
             line(17, "Direction", "--", direction);
         }
-        if (rows >= 20) {
-            draw_text(19, 1, cols - 2,
-                      "Radio demo status is inferred; Engine status uses health telemetry", PairMuted);
+        if (rows >= 19)
+            line(18, "Health age", health_age_text(s.radio_health_seen, s.radio_health_at),
+                 health_age_text(s.engine_health_seen, s.engine_health_at));
+        if (rows >= 20)
+            line(19, "Health sequence",
+                 s.radio_health_seen ? std::to_string(s.radio_health_sequence) : "--",
+                 s.engine_health_seen ? std::to_string(s.engine_health_sequence) : "--");
+        if (rows >= 22) {
+            draw_text(21, 1, cols - 2,
+                      "CPU/RAM from SOME/IP health; (demo) = metadata fallback; -- = no measurement",
+                      PairMuted);
         }
     }
 
@@ -604,7 +642,9 @@ int main() {
             ClientState snapshot;
             {
                 std::lock_guard<std::mutex> lock(state_mutex);
-                state.refresh_engine_health(std::chrono::steady_clock::now());
+                const auto now = std::chrono::steady_clock::now();
+                state.refresh_radio_health(now);
+                state.refresh_engine_health(now);
                 snapshot = state;
             }
             const auto now = std::chrono::steady_clock::now();
@@ -620,6 +660,12 @@ int main() {
         app->stop();
         vsomeip_thread.join();
         app->clear_all_handler();
+        app->unsubscribe(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_HEALTH_EVENTGROUP_ID);
+        app->unsubscribe(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_EVENTGROUP_ID);
+        app->release_event(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, RADIO_HEALTH_EVENT_ID);
+        for (vsomeip::event_t id : {RADIO_VOLUME_EVENT_ID, RADIO_STATION_EVENT_ID,
+                                    RADIO_SONG_EVENT_ID, RADIO_ARTIST_EVENT_ID})
+            app->release_event(RADIO_SERVICE_ID, RADIO_INSTANCE_ID, id);
         app->release_service(RADIO_SERVICE_ID, RADIO_INSTANCE_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_HEALTH_EVENTGROUP_ID);
         app->unsubscribe(ENGINE_SERVICE_ID, ENGINE_INSTANCE_ID, ENGINE_EVENTGROUP_ID);

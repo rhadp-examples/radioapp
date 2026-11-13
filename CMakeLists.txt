@@ -23,7 +23,7 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(radio-service radio-service.cpp services.hpp radio-stations.cpp)
+add_executable(radio-service radio-service.cpp services.hpp demo-health.hpp radio-demo-health.hpp radio-stations.cpp)
 target_link_libraries(radio-service  vsomeip3 ${Boost_LIBRARIES})
 
 add_executable(radio-client radio-client.cpp radio-client-state.hpp demo-health.hpp services.hpp)
@@ -44,4 +44,8 @@ if(BUILD_TESTING)
                    demo-health.hpp engine-demo-memory.hpp radio-client-state.hpp)
     target_include_directories(demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME demo-health-test COMMAND demo-health-test)
+    add_executable(radio-demo-health-test tests/radio-demo-health-test.cpp
+                   demo-health.hpp radio-demo-health.hpp radio-client-state.hpp)
+    target_include_directories(radio-demo-health-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME radio-demo-health-test COMMAND radio-demo-health-test)
 endif()
