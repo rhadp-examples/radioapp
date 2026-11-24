@@ -1,0 +1,36 @@
+module auto-apps 1.0;
+
+require {
+        type qm_t;
+        type ipc_var_run_t;
+        type ipc_t;
+        type vsomeip_t;
+        type vsomeip_var_run_t;
+        type qm_file_t;
+        type qm_container_ipc_t;
+        class dir { add_name relabelfrom remove_name search write };
+        class file { create lock open read unlink write };
+        class sock_file { create open read setattr unlink write };
+        class unix_stream_socket connectto;
+}
+
+#============= qm_container_ipc_t ==============
+allow qm_container_ipc_t qm_file_t:dir { add_name remove_name write };
+allow qm_container_ipc_t qm_file_t:file { create unlink write };
+allow qm_container_ipc_t qm_file_t:sock_file { create setattr unlink write };
+allow qm_container_ipc_t vsomeip_var_run_t:sock_file unlink;
+
+#============= qm_t ==============
+allow qm_t ipc_var_run_t:dir { relabelfrom remove_name write };
+allow qm_t ipc_var_run_t:file { lock open read unlink };
+allow qm_t ipc_var_run_t:sock_file { open read unlink write };
+allow qm_t qm_container_ipc_t:unix_stream_socket connectto;
+
+#============= vsomeip_t ==============
+allow vsomeip_t ipc_t:unix_stream_socket connectto;
+allow vsomeip_t ipc_var_run_t:dir { add_name search write };
+allow vsomeip_t ipc_var_run_t:file { create lock open write };
+allow vsomeip_t ipc_var_run_t:sock_file { create setattr write };
+allow vsomeip_t qm_container_ipc_t:unix_stream_socket connectto;
+allow vsomeip_t qm_file_t:dir { search write };
+

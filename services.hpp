@@ -11,10 +11,16 @@
 #define RADIO_SWITCH_STATION_METHOD_ID 5
 
 #define RADIO_EVENTGROUP_ID 0x4001
+
+// Demo-only station event value indicating RAM allocation failure.
+#define RADIO_RAM_FAILURE_MARKER "__RADIO_DEMO_RAM_FAILURE__"
 #define RADIO_VOLUME_EVENT_ID 0x8000 + 1
 #define RADIO_STATION_EVENT_ID 0x8000 + 2
 #define RADIO_SONG_EVENT_ID 0x8000 + 3
 #define RADIO_ARTIST_EVENT_ID 0x8000 + 4
+// Demo-only health telemetry is separate from the radio metadata eventgroup.
+#define RADIO_HEALTH_EVENTGROUP_ID 0x4004
+#define RADIO_HEALTH_EVENT_ID 0x8000 + 5
 
 #define ENGINE_SERVICE_ID 0x1001
 #define ENGINE_INSTANCE_ID 1
@@ -23,6 +29,10 @@
 
 #define ENGINE_EVENTGROUP_ID 0x4002
 #define ENGINE_REVERSE_EVENT_ID 0x8000 + 1
+// Demo-only health event uses a separate eventgroup, so radio-service does
+// not receive diagnostic traffic when it subscribes to reverse events.
+#define ENGINE_HEALTH_EVENTGROUP_ID 0x4003
+#define ENGINE_HEALTH_EVENT_ID 0x8000 + 2
 
 static uint32_t inline
 payload_get_arg(std::shared_ptr<vsomeip::payload> its_payload)

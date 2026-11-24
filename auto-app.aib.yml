@@ -1,0 +1,421 @@
+# Example of a minimal image with auto-app RPM installed
+
+name: auto-app
+
+content:
+  repos:
+    - id: epel
+      baseurl: https://ftp-stud.hs-esslingen.de/pub/epel/10.4/Everything/aarch64/
+      priority: 20
+    - id: bigmachine
+      baseurl: http://rpmrepo-rpmrepo.apps.ocp.boernig.name/AutoSD-AT/repos/10-stream/
+      priority: 10
+    - id: local
+      baseurl: file:///workspace/export/
+      priority: 5      
+  rpms:
+    - auto-app
+    - vim
+    - curl
+    - gdb
+    - greenboot-default-health-checks
+    - iproute
+    - iputils
+    - less
+    - openssh-clients
+    - openssh-server
+    - pciutils
+    - podman
+    - python3-pip
+    - qm
+    - strace
+    - stress-ng
+    - tcpdump
+    - xauth
+    - xterm
+    - auto-apps
+    - auto-apps-selinux
+    - dlt-daemon
+    - dlt-tools
+    - container-selinux
+    - selinux-policy-automotive
+    - vsomeip3-routingmanager
+    - vsomeip3-selinux
+    - vsomeip3-tools
+    - policycoreutils-python-utils
+    - audit
+  container_images:
+    - source: quay.io/shetze/auto-apps
+      tag: latest
+      name: localhost/auto-apps
+  make_dirs:
+    - path: /etc/containers/systemd/qm.container.d
+      parents: true
+      exist_ok: true
+    - path: /etc/qm/containers/systemd/
+      parents: true
+      exist_ok: true
+    - path: /etc/systemd/system/sockets.target.wants
+      parents: true
+      exist_ok: true
+  add_files:
+    - path: /etc/selinux/config
+      text: |
+        SELINUX=enforcing
+        SELINUXTYPE=automotive
+    - path: /usr/lib/tmpfiles.d/relabel.conf
+      text: |
+        Z /run/ipc - - - -
+    - path: /usr/lib/tmpfiles.d/vsomeip3.conf
+      text: |
+        D /run/ipc/vsomeip 01777 root root -
+        L /run/vsomeip - - - - /run/ipc/vsomeip
+    - path: /usr/lib/tmpfiles.d/dlt.conf
+      text: |
+        D /run/ipc/dlt 01777 root root -
+        L /run/dlt - - - - /run/ipc/dlt
+    - path: /usr/lib/systemd/system/dlt.service
+      text: |
+        [Unit]
+        Description=COVESA DLT logging daemon
+        Documentation=man:dlt-daemon(1) man:dlt.conf(5)
+        DefaultDependencies=no
+        Before=shutdown.target
+        Conflicts=shutdown.target
+        After=tmp.mount
+        Requires=dlt.socket
+        
+        [Service]
+        Type=simple
+        User=dlt-daemon
+        ExecStart=/usr/bin/dlt-daemon
+        # WatchdogSec=2
+        NotifyAccess=main
+        LimitCORE=infinity
+        
+        [Install]
+        WantedBy=multi-user.target
+    - path: /usr/lib/systemd/system/dlt.socket
+      text: |
+        [Unit]
+        Description=vsomeip routing manager activation socket
+        After=systemd-tmpfiles-setup.service
+        
+        [Socket]
+        ListenStream=%t/dlt/dlt.socket
+        SocketUser=root
+        SocketGroup=root
+        SELinuxContextFromNet=yes
+        
+        [Install]
+        WantedBy=sockets.target
+    - path: /usr/lib/systemd/system/routingmanagerd.socket
+      text: |
+        [Unit]
+        Description=vsomeip routing manager activation socket
+        After=systemd-tmpfiles-setup.service
+        
+        [Socket]
+        ListenStream=%t/vsomeip/vsomeip-0
+        SocketUser=routingmanagerd
+        SocketGroup=routingmanagerd
+        SELinuxContextFromNet=yes
+        
+        [Install]
+        WantedBy=sockets.target
+    - path: /etc/containers/systemd/qm.container.d/vsomeip-qm.conf
+      text: |
+        [Container]
+        Volume=/run/ipc/:/run/ipc/
+        Volume=/run/vsomeip/:/run/vsomeip/
+        Volume=/run/dlt/:/run/dlt/
+    - path: /etc/containers/systemd/dlt.container
+      text: |
+        [Unit]
+        Description=COVESA DLT logging daemo (asil-to-qm)
+        Before=shutdown.target
+        Conflicts=shutdown.target
+        After=tmp.mount
+        Requires=dlt.socket
+        
+        [Container]
+        Image=quay.io/shetze/atdev:auto-apps
+        Network=none
+        Volume=/run/vsomeip/:/run/vsomeip/
+        Volume=/run/dlt/:/run/dlt/
+        SecurityLabelType=ipc_t
+        Exec=/usr/bin/dlt-daemon
+        
+        [Service]
+        Restart=always
+        Type=notify
+        NotifyAccess=main
+        LimitCORE=infinity
+        
+        [Install]
+        WantedBy=multi-user.target
+    - path: /etc/containers/systemd/engine.container
+      text: |
+        [Unit]
+        Description=engine service container (asil-to-qm)
+        Requires=routingmanagerd.service
+        After=routingmanagerd.service
+        
+        [Container]
+        Image=localhost/auto-apps
+        Network=none
+        Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+        Volume=/var/run/vsomeip/:/var/run/vsomeip/
+        Volume=/var/run/dlt/:/var/run/dlt/
+        SecurityLabelType=ipc_t
+        Exec=/usr/bin/engine-service
+        
+        [Service]
+        Restart=always
+        Type=notify
+        
+        [Install]
+        WantedBy=multi-user.target
+    - path: /etc/vsomeip.json
+      text: |
+        {
+          "routing": {
+            "host": {
+              "name": "routingmanagerd",
+              "unicast": "10.88.0.1",
+              "port": "31000"
+            },
+            "guests": {
+              "unicast": "10.88.0.1",
+              "ports": [
+                {
+                  "first": "1026",
+                  "last": "65535"
+                }
+              ]
+            }
+          },
+          "logging": {
+            "level": "info",
+            "console": "true",
+            "dlt": "false"
+          },
+          "applications": [
+            {
+              "name": "routingmanagerd",
+              "id": "0x0101"
+            },
+            {
+              "name": "Radio",
+              "id": "0x1000"
+            },
+            {
+              "name": "Engine",
+              "id": "0x1001"
+            },
+            {
+              "name": "Radio client",
+              "id": "0x1002"
+            }
+          ],
+          "services": [
+            {
+              "service": "0x1000",
+              "instance": "0x01",
+              "unreliable": "30509"
+            },
+            {
+              "service": "0x1001",
+              "instance": "0x01",
+              "unreliable": "30509"
+            }
+          ],
+          "service-discovery": {
+            "enable": "true",
+            "multicast": "224.224.224.245",
+            "port": "30490",
+            "protocol": "tcp",
+            "initial_delay_min": "10",
+            "initial_delay_max": "100",
+            "repetitions_base_delay": "200",
+            "repetitions_max": "3",
+            "ttl": "3",
+            "cyclic_offer_delay": "2000",
+            "request_response_delay": "1500"
+          }
+        }
+  add_symlinks:
+    - link: /etc/systemd/system/sockets.target.wants/routingmanagerd.socket
+      target: /usr/lib/systemd/system/routingmanagerd.socket
+  systemd:
+    enabled_services:
+      # Enable ssh daemon
+      - sshd.service
+      - routingmanagerd.service
+      - dlt.service
+
+
+qm:
+  content:
+    repos:
+      - id: epel
+        baseurl: https://ftp-stud.hs-esslingen.de/pub/epel/10.4/Everything/aarch64/
+        priority: 20
+      - id: bigmachine
+        baseurl: http://rpmrepo-rpmrepo.apps.ocp.boernig.name/AutoSD-AT/repos/10-stream/
+        priority: 10
+    rpms:
+      - python3-pip
+      - vim
+      - iproute
+      - curl
+      - strace
+      - iputils
+      - tcpdump
+      - auto-apps
+    container_images:
+      - source: quay.io/centos/arm64v8
+        tag: stream10
+        name: localhost/cs10      
+      - source: quay.io/shetze/auto-apps
+        tag: latest
+        name: localhost/auto-apps
+    add_files:
+      - path: /etc/containers/systemd/dlt.container
+        text: |
+          [Unit]
+          Description=dlt service container (asil-to-qm)
+          
+          [Container]
+          Image=localhost/auto-apps
+          Network=none
+          Volume=/run/vsomeip/:/run/vsomeip/
+          Volume=/run/dlt/:/run/dlt/
+          Volume=/run/ipc/:/run/ipc/
+          SecurityLabelType=qm_container_ipc_t
+          Exec=/usr/bin/dlt-daemon
+          
+          [Service]
+          Restart=always
+          Type=notify
+          
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/containers/systemd/routingmanagerd.container
+        text: |
+          [Unit]
+          Description=vsomeip routingmanager container (asil-to-qm)
+          After=dlt.service
+          
+          [Container]
+          Image=localhost/auto-apps
+          Network=none
+          Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+          Volume=/run/vsomeip/:/run/vsomeip/
+          Volume=/run/dlt/:/run/dlt/
+          Volume=/run/ipc/:/run/ipc/
+          SecurityLabelType=qm_container_ipc_t
+          Exec=/usr/bin/routingmanagerd
+          
+          [Service]
+          Restart=always
+          Type=notify
+          
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/containers/systemd/radio.container
+        text: |
+          [Unit]
+          Description=radio service container (asil-to-qm)
+          
+          [Container]
+          Image=localhost/auto-apps
+          Environment=SOCKET_PATH=/run/vsomeip/vsomeip-0
+          Volume=/run/vsomeip/:/run/vsomeip/
+          Volume=/run/dlt/:/run/dlt/
+          Volume=/run/ipc/:/run/ipc/
+          SecurityLabelType=qm_container_ipc_t
+          # SecurityLabelLevel=s0
+          Network=host
+          Exec=/usr/bin/radio-service
+          
+          [Service]
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/vsomeip.json
+        text: |
+          {
+            "routing": {
+              "host": {
+                "name": "routingmanagerd",
+                "unicast": "10.88.0.1",
+                "port": "31000"
+              },
+              "guests": {
+                "unicast": "10.88.0.1",
+                "ports": [
+                  {
+                    "first": "1026",
+                    "last": "65535"
+                  }
+                ]
+              }
+            },
+            "logging": {
+              "level": "info",
+              "console": "true",
+              "dlt": "false"
+            },
+            "applications": [
+              {
+                "name": "routingmanagerd",
+                "id": "0x0101"
+              },
+              {
+                "name": "Radio",
+                "id": "0x1000"
+              },
+              {
+                "name": "Engine",
+                "id": "0x1001"
+              },
+              {
+                "name": "Radio client",
+                "id": "0x1002"
+              }
+            ],
+            "services": [
+              {
+                "service": "0x1000",
+                "instance": "0x01",
+                "unreliable": "30509"
+              },
+              {
+                "service": "0x1001",
+                "instance": "0x01",
+                "unreliable": "30509"
+              }
+            ],
+            "service-discovery": {
+              "enable": "true",
+              "multicast": "224.224.224.245",
+              "port": "30490",
+              "protocol": "tcp",
+              "initial_delay_min": "10",
+              "initial_delay_max": "100",
+              "repetitions_base_delay": "200",
+              "repetitions_max": "3",
+              "ttl": "3",
+              "cyclic_offer_delay": "2000",
+              "request_response_delay": "1500"
+            }
+          }
+
+network:
+  dynamic: {}
+
+auth:
+  # "password"
+  root_password: $6$xoLqEUz0cGGJRx01$H3H/bFm0myJPULNMtbSsOFd/2BnHqHkMD92Sfxd.EKM9hXTWSmELG8cf205l6dktomuTcgKGGtGDgtvHVXSWU.
